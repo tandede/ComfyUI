@@ -7,6 +7,7 @@ import av
 import io
 from fractions import Fraction
 from comfy_api.input_impl.video_types import VideoFromFile, VideoFromComponents
+from comfy_api.latest._util.video_types import normalize_crop_rect
 from comfy_api.util.video_types import VideoComponents, VideoContainer, VideoCodec
 from comfy_api.input.basic_types import AudioInput
 from av.error import InvalidDataError
@@ -791,3 +792,60 @@ def test_save_to_transcode_skips_undecodable_audio():
         for path in (mixed, all_bad):
             if path:
                 os.unlink(path)
+
+
+def test_as_trimmed_strict_duration_gates_unavailable_length(simple_video_file):
+    video = VideoFromFile(simple_video_file)
+
+    assert video.as_trimmed(0.0, 10.0, strict_duration=True) is None
+
+    relaxed = video.as_trimmed(0.0, 10.0, strict_duration=False)
+    assert relaxed is not None
+    assert relaxed.get_duration() < 10.0
+    assert relaxed.get_duration() == pytest.approx(video.get_duration(), abs=EPSILON)
+
+
+def test_normalize_crop_rect_aligns_odd_origin_to_chroma_grid():
+    assert normalize_crop_rect(1, 1, 100, 100, 1920, 1080) == (0, 0, 100, 100)
+    assert normalize_crop_rect(3, 5, 10, 9, 64, 48) == (2, 4, 10, 8)
+    assert normalize_crop_rect(0, 0, 64, 48, 64, 48) is None
+
+
+def _create_marker_video(path, width=64, height=48, marker_x=2, frames=3, fps=8):
+    with av.open(path, mode="w") as container:
+        stream = container.add_stream("h264", rate=fps)
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        pixels = torch.zeros(height, width, 3, dtype=torch.uint8).numpy()
+        pixels[:, marker_x:marker_x + 2, :] = 255
+        for _ in range(frames):
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            frame = frame.reformat(format="yuv420p")
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode(None))
+
+
+def _brightest_column(images):
+    return images[0].float().mean(dim=(0, 2)).argmax().item()
+
+
+def test_cropped_decode_and_save_paths_select_same_pixels(tmp_path):
+    source = str(tmp_path / "marker.mp4")
+    _create_marker_video(source, marker_x=4)
+
+    cropped = VideoFromFile(source).as_cropped(3, 1, 16, 16)
+
+    components = cropped.get_components()
+    assert tuple(components.images.shape[1:3]) == (16, 16)
+    decode_column = _brightest_column(components.images)
+    assert decode_column in (2, 3)
+
+    saved = str(tmp_path / "cropped.mp4")
+    cropped.save_to(saved)
+    saved_components = VideoFromFile(saved).get_components()
+    assert tuple(saved_components.images.shape[1:3]) == (16, 16)
+    save_column = _brightest_column(saved_components.images)
+    assert save_column in (2, 3)
+
+    assert decode_column == save_column
